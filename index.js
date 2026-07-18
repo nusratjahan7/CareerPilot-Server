@@ -84,6 +84,28 @@ async function run() {
             }
         });
 
+        // GET: Fetch only the careers created by the currently logged-in user
+        app.get('/api/my-careers', authenticateUser, async (req, res) => {
+            try {
+                // req.userId is automatically populated by your authenticateUser middleware
+                const userCareers = await careersCollection
+                    .find({ userId: req.userId })
+                    .sort({ createdAt: -1 })
+                    .toArray();
+
+                res.status(200).json({
+                    success: true,
+                    count: userCareers.length,
+                    data: userCareers
+                });
+            } catch (error) {
+                console.error("Error fetching user's specific career listings:", error);
+                res.status(500).json({
+                    error: 'Failed to retrieve your career listings.'
+                });
+            }
+        });
+
 
         // POST: Add a new career listing
         app.post('/api/careers', authenticateUser, async (req, res) => {
