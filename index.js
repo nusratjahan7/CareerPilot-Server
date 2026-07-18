@@ -62,6 +62,27 @@ async function run() {
             }
         };
 
+        // GET: Fetch all career listings
+        app.get('/api/careers', async (req, res) => {
+            try {
+                // Fetch all listings from the collection and sort by newest first
+                const careers = await careersCollection
+                    .find({})
+                    .sort({ createdAt: -1 })
+                    .toArray();
+
+                res.status(200).json({
+                    success: true,
+                    count: careers.length,
+                    data: careers
+                });
+            } catch (error) {
+                console.error("Error fetching career listings:", error);
+                res.status(500).json({
+                    error: 'Failed to retrieve career listings due to an internal server error.'
+                });
+            }
+        });
 
 
         // POST: Add a new career listing
