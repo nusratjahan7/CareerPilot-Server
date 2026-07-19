@@ -59,7 +59,7 @@ async function run() {
         // GET: Fetch only the careers created by the currently logged-in user
         app.get('/api/my-careers', async (req, res) => {
             try {
-                // req.userId is automatically populated by your authenticateUser middleware
+
                 const userCareers = await careersCollection
                     .find({ userId: req.userId })
                     .sort({ createdAt: -1 })
@@ -92,35 +92,29 @@ async function run() {
                     location,
                     coverImage,
                     responsibilities,
-                    skills
+                    skills,
+                    userId,
+                    creatorEmail
                 } = req.body;
 
-                if (
-                    !title?.trim() ||
-                    !category?.trim() ||
-                    !shortDescription?.trim() ||
-                    !fullDescription?.trim() ||
-                    !salaryRange?.trim() ||
-                    !experienceLevel?.trim() ||
-                    !location?.trim() ||
-                    !Array.isArray(responsibilities) || responsibilities.length === 0 ||
-                    !Array.isArray(skills) || skills.length === 0
-                ) {
-                    return res.status(400).json({ error: 'All fields marked with an asterisk (*) are mandatory.' });
+
+                if (!title || !category || !shortDescription || !fullDescription || !userId) {
+                    return res.status(400).json({ error: "Missing required fields, including User Authentication." });
                 }
 
                 const newCareerListing = {
-                    userId: req.userId || null,
-                    title: title.trim(),
-                    category: category.trim(),
-                    shortDescription: shortDescription.trim(),
-                    fullDescription: fullDescription.trim(),
-                    salaryRange: salaryRange.trim(),
-                    experienceLevel: experienceLevel.trim(),
-                    location: location.trim(),
-                    coverImage: coverImage && coverImage.trim() !== "" ? coverImage.trim() : null,
-                    responsibilities: responsibilities.map(item => item.trim()).filter(Boolean),
-                    skills: skills.map(item => item.trim()).filter(Boolean),
+                    title,
+                    category,
+                    shortDescription,
+                    fullDescription,
+                    salaryRange,
+                    experienceLevel,
+                    location,
+                    imageUrl: coverImage || "https://images.unsplash.com/photo-1586717791821-3f44a563fa4c?q=80&w=80",
+                    responsibilities: Array.isArray(responsibilities) ? responsibilities : [],
+                    skills: Array.isArray(skills) ? skills : [],
+                    userId: userId,
+                    creatorEmail,
                     createdAt: new Date()
                 };
 
@@ -128,16 +122,15 @@ async function run() {
 
                 return res.status(201).json({
                     success: true,
-                    message: 'Career listing successfully created.',
+                    message: "Career listing created successfully!",
                     insertedId: result.insertedId
                 });
 
             } catch (error) {
                 console.error("Error creating career listing:", error);
-                return res.status(500).json({ error: 'Failed to create career listing due to internal database error.' });
+                return res.status(500).json({ error: "Internal server error." });
             }
         });
-
         // GET: Fetch single career by ID
         app.get('/api/careers/:id', async (req, res) => {
             try {
@@ -238,6 +231,44 @@ async function run() {
                 return res.status(500).json({ error: 'Internal server error while processing application.' });
             }
         });
+
+        app.delete('/api/careers/:id', async (req, res) => {
+            try {
+                const careerId = req.params.id;
+
+
+                if (!ObjectId.isValid(careerId)) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Invalid career listing ID format.'
+                    });
+                }
+
+
+                const result = await careersCollection.deleteOne({ _id: new ObjectId(careerId) });
+
+
+                if (result.deletedCount === 1) {
+                    return res.status(200).json({
+                        success: true,
+                        message: 'Career listing deleted successfully! 🗑️'
+                    });
+                } else {
+                    return res.status(404).json({
+                        success: false,
+                        error: 'Career listing not found.'
+                    });
+                }
+
+            } catch (error) {
+                console.error("Error deleting career listing:", error);
+                return res.status(500).json({
+                    success: false,
+                    error: 'Internal server error.'
+                });
+            }
+        });
+
         // await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } finally {
