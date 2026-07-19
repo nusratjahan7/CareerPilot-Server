@@ -28,39 +28,11 @@ async function run() {
         const db = client.db(dbName);
 
         const careersCollection = db.collection("careers");
-        const sessionsCollection = db.collection("session"); // Default Better-Auth session collection name
-        const usersCollection = db.collection("user");       // Default Better-Auth user collection name
+        const sessionsCollection = db.collection("session");
+        const usersCollection = db.collection("user");
+        const savedCareersCollection = db.collection("saved-careers");
+        const applicationsCollection = db.collection("applications");
 
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
-
-        // --- Custom Authentication Middleware ---
-        const authenticateUser = async (req, res, next) => {
-            try {
-                const authHeader = req.headers.authorization;
-                if (!authHeader || !authHeader.startsWith('Bearer ')) {
-                    return res.status(401).json({ error: 'Unauthorized access. Token missing.' });
-                }
-
-                const token = authHeader.split(' ')[1];
-
-                const sessionRecord = await sessionsCollection.findOne({ token: token });
-
-                if (!sessionRecord) {
-                    return res.status(401).json({ error: 'Invalid or expired session token.' });
-                }
-
-
-                if (new Date(sessionRecord.expiresAt) < new Date()) {
-                    return res.status(401).json({ error: 'Session token has expired.' });
-                }
-
-                req.userId = sessionRecord.userId;
-                next();
-            } catch (error) {
-                console.error("Auth Middleware Error:", error);
-                res.status(500).json({ error: 'Internal Server Error validating authentication.' });
-            }
-        };
 
         // GET: Fetch all career listings
         app.get('/api/careers', async (req, res) => {
@@ -85,7 +57,7 @@ async function run() {
         });
 
         // GET: Fetch only the careers created by the currently logged-in user
-        app.get('/api/my-careers', authenticateUser, async (req, res) => {
+        app.get('/api/my-careers', async (req, res) => {
             try {
                 // req.userId is automatically populated by your authenticateUser middleware
                 const userCareers = await careersCollection
@@ -108,30 +80,53 @@ async function run() {
 
 
         // POST: Add a new career listing
-        app.post('/api/careers', authenticateUser, async (req, res) => {
+        app.post('/api/careers', async (req, res) => {
             try {
-                const { title, category, shortDescription, fullDescription, salaryRange, experienceLevel, coverImage } = req.body;
-
-                // Server-side structural validation check
-                if (!title || !category || !shortDescription || !fullDescription || !salaryRange || !experienceLevel) {
-                    return res.status(400).json({ error: 'All fields marked with an asterisk (*) are mandatory.' });
-                }
-
-                const newCareerListing = {
-                    userId: req.userId,
+                const {
                     title,
                     category,
                     shortDescription,
                     fullDescription,
                     salaryRange,
                     experienceLevel,
-                    coverImage: coverImage || null,
+                    location,
+                    coverImage,
+                    responsibilities,
+                    skills
+                } = req.body;
+
+                if (
+                    !title?.trim() ||
+                    !category?.trim() ||
+                    !shortDescription?.trim() ||
+                    !fullDescription?.trim() ||
+                    !salaryRange?.trim() ||
+                    !experienceLevel?.trim() ||
+                    !location?.trim() ||
+                    !Array.isArray(responsibilities) || responsibilities.length === 0 ||
+                    !Array.isArray(skills) || skills.length === 0
+                ) {
+                    return res.status(400).json({ error: 'All fields marked with an asterisk (*) are mandatory.' });
+                }
+
+                const newCareerListing = {
+                    userId: req.userId || null,
+                    title: title.trim(),
+                    category: category.trim(),
+                    shortDescription: shortDescription.trim(),
+                    fullDescription: fullDescription.trim(),
+                    salaryRange: salaryRange.trim(),
+                    experienceLevel: experienceLevel.trim(),
+                    location: location.trim(),
+                    coverImage: coverImage && coverImage.trim() !== "" ? coverImage.trim() : null,
+                    responsibilities: responsibilities.map(item => item.trim()).filter(Boolean),
+                    skills: skills.map(item => item.trim()).filter(Boolean),
                     createdAt: new Date()
                 };
 
                 const result = await careersCollection.insertOne(newCareerListing);
 
-                res.status(201).json({
+                return res.status(201).json({
                     success: true,
                     message: 'Career listing successfully created.',
                     insertedId: result.insertedId
@@ -139,12 +134,110 @@ async function run() {
 
             } catch (error) {
                 console.error("Error creating career listing:", error);
-                res.status(500).json({ error: 'Failed to create career listing due to internal database error.' });
+                return res.status(500).json({ error: 'Failed to create career listing due to internal database error.' });
             }
         });
 
+        // GET: Fetch single career by ID
+        app.get('/api/careers/:id', async (req, res) => {
+            try {
+                const { id } = req.params;
 
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).json({ error: 'Invalid career ID format.' });
+                }
 
+                const career = await careersCollection.findOne({ _id: new ObjectId(id) });
+
+                if (!career) {
+                    return res.status(404).json({ error: 'Career insights not found.' });
+                }
+
+                return res.status(200).json({
+                    success: true,
+                    data: career
+                });
+            } catch (error) {
+                console.error(error);
+                return res.status(500).json({ error: 'Internal server error while fetching career details.' });
+            }
+        });
+
+        app.post('/api/saved-careers', async (req, res) => {
+            try {
+                const { careerId, userId } = req.body; // 👈 ফ্রন্টএন্ড থেকে userId পাঠানো যেতে পারে অথবা ডামি আইডি
+
+                if (!careerId || !ObjectId.isValid(careerId)) {
+                    return res.status(400).json({ error: 'A valid career ID is required.' });
+                }
+
+                // অথেনটিকেশন না থাকলে ডামি আইডি বা ফ্রন্টএন্ডের আইডি ব্যবহার
+                const finalUserId = userId && ObjectId.isValid(userId) ? new ObjectId(userId) : new ObjectId("60c72b2f9b1d8b2bad888888");
+
+                const existingSave = await savedCareersCollection.findOne({
+                    userId: finalUserId,
+                    careerId: new ObjectId(careerId)
+                });
+
+                if (existingSave) {
+                    return res.status(409).json({ error: 'Career already saved.' });
+                }
+
+                const newSave = {
+                    userId: finalUserId,
+                    careerId: new ObjectId(careerId),
+                    savedAt: new Date()
+                };
+
+                const result = await savedCareersCollection.insertOne(newSave);
+
+                return res.status(201).json({
+                    success: true,
+                    message: 'Career successfully saved to collection.',
+                    insertedId: result.insertedId
+                });
+            } catch (error) {
+                console.error(error);
+                return res.status(500).json({ error: 'Internal server error while saving career.' });
+            }
+        });
+
+        app.post('/api/applications', async (req, res) => {
+            try {
+                const { careerId, fullName, email, resumeUrl, coverLetter, userId } = req.body;
+
+                if (!careerId || !ObjectId.isValid(careerId)) {
+                    return res.status(400).json({ error: 'A valid career ID is required.' });
+                }
+
+                if (!fullName?.trim() || !email?.trim() || !resumeUrl?.trim()) {
+                    return res.status(400).json({ error: 'Full name, email, and resume link are mandatory.' });
+                }
+
+                const finalUserId = userId && ObjectId.isValid(userId) ? new ObjectId(userId) : new ObjectId("60c72b2f9b1d8b2bad888888");
+
+                const newApplication = {
+                    userId: finalUserId,
+                    careerId: new ObjectId(careerId),
+                    fullName: fullName.trim(),
+                    email: email.trim(),
+                    resumeUrl: resumeUrl.trim(),
+                    coverLetter: coverLetter ? coverLetter.trim() : null,
+                    appliedAt: new Date()
+                };
+
+                const result = await applicationsCollection.insertOne(newApplication);
+
+                return res.status(201).json({
+                    success: true,
+                    message: 'Application successfully processed.',
+                    insertedId: result.insertedId
+                });
+            } catch (error) {
+                console.error(error);
+                return res.status(500).json({ error: 'Internal server error while processing application.' });
+            }
+        });
         // await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } finally {
