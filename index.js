@@ -25,7 +25,6 @@ const client = new MongoClient(uri, {
     }
 });
 
-// ---- /api/chat: doesn't touch the DB, so it can be registered immediately ----
 app.post('/api/chat', async (req, res) => {
     const { sessionId, messages } = req.body;
 
@@ -40,8 +39,7 @@ app.post('/api/chat', async (req, res) => {
     res.setHeader('Transfer-Encoding', 'chunked');
 
     try {
-        // Gemini uses 'model' instead of 'assistant', and expects contents as
-        // { role, parts: [{ text }] } rather than { role, content }.
+
         const contents = messages.map((m) => ({
             role: m.role === 'assistant' ? 'model' : 'user',
             parts: [{ text: m.content }],
@@ -78,9 +76,68 @@ async function run() {
         const dbName = process.env.AUTH_DB_NAME;
         const db = client.db(dbName);
 
+        const usersCollection = db.collection("user");
         const careersCollection = db.collection("careers");
         const savedCareersCollection = db.collection("saved-careers");
         const applicationsCollection = db.collection("applications");
+
+        app.get('/api/profile/:userId', async (req, res) => {
+            try {
+                const { userId } = req.params;
+
+                if (!ObjectId.isValid(userId)) {
+                    return res.status(400).json({ success: false, error: 'Invalid user ID format.' });
+                }
+
+                const user = await usersCollection.findOne(
+                    { _id: new ObjectId(userId) },
+                    { projection: { name: 1, email: 1, emailVerified: 1, image: 1, createdAt: 1 } }
+                );
+
+                if (!user) {
+                    return res.status(404).json({ success: false, error: 'User not found.' });
+                }
+
+                res.status(200).json({ success: true, data: user });
+            } catch (error) {
+                console.error("Error fetching profile:", error);
+                res.status(500).json({ success: false, error: 'Failed to retrieve profile.' });
+            }
+        });
+
+        // PATCH: Update name and/or avatar image
+        app.patch('/api/profile', async (req, res) => {
+            try {
+                const { userId, name, image } = req.body;
+
+                if (!userId || !ObjectId.isValid(userId)) {
+                    return res.status(400).json({ success: false, error: 'A valid user ID is required.' });
+                }
+
+                const update = { updatedAt: new Date() };
+                if (typeof name === 'string' && name.trim()) update.name = name.trim();
+                if (typeof image === 'string') update.image = image; // data URL or hosted URL
+
+                if (Object.keys(update).length === 1) {
+                    return res.status(400).json({ success: false, error: 'Nothing to update.' });
+                }
+
+                const result = await usersCollection.findOneAndUpdate(
+                    { _id: new ObjectId(userId) },
+                    { $set: update },
+                    { returnDocument: 'after', projection: { name: 1, email: 1, emailVerified: 1, image: 1, createdAt: 1 } }
+                );
+
+                if (!result) {
+                    return res.status(404).json({ success: false, error: 'User not found.' });
+                }
+
+                res.status(200).json({ success: true, data: result });
+            } catch (error) {
+                console.error("Error updating profile:", error);
+                res.status(500).json({ success: false, error: 'Failed to update profile.' });
+            }
+        });
 
         // GET: Fetch all career listings
         app.get('/api/careers', async (req, res) => {
