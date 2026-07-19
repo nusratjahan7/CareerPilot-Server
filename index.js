@@ -1,16 +1,19 @@
-const express = require('express');
-const dotenv = require('dotenv');
-const cors = require('cors');
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+import express from 'express';
+import dotenv from 'dotenv';
+import cors from 'cors';
+import { MongoClient, ServerApiVersion, ObjectId } from 'mongodb';
+import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const sessionStore = new Map();
 
 const uri = process.env.MONGODB_URI;
 
@@ -21,6 +24,54 @@ const client = new MongoClient(uri, {
         deprecationErrors: true,
     }
 });
+
+// ---- /api/chat: doesn't touch the DB, so it can be registered immediately ----
+app.post('/api/chat', async (req, res) => {
+    const { sessionId, messages } = req.body;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ error: 'messages[] is required' });
+    }
+
+    sessionStore.set(sessionId, messages);
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    try {
+        // Gemini uses 'model' instead of 'assistant', and expects contents as
+        // { role, parts: [{ text }] } rather than { role, content }.
+        const contents = messages.map((m) => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+        }));
+
+        const stream = await ai.models.generateContentStream({
+            model: 'gemini-flash-latest',
+            contents,
+            config: {
+                systemInstruction:
+                    'You are a helpful, concise assistant embedded in a product chat widget. ' +
+                    'Use the prior turns in this conversation to stay consistent and avoid repeating yourself.',
+            },
+        });
+
+        for await (const chunk of stream) {
+            const text = chunk.text;
+            if (text) res.write(text);
+        }
+        res.end();
+    } catch (err) {
+        console.error('Chat route error:', err);
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'Failed to generate response' });
+        } else {
+            res.end();
+        }
+    }
+});
+
 async function run() {
     try {
         await client.connect();
@@ -28,16 +79,12 @@ async function run() {
         const db = client.db(dbName);
 
         const careersCollection = db.collection("careers");
-        const sessionsCollection = db.collection("session");
-        const usersCollection = db.collection("user");
         const savedCareersCollection = db.collection("saved-careers");
         const applicationsCollection = db.collection("applications");
-
 
         // GET: Fetch all career listings
         app.get('/api/careers', async (req, res) => {
             try {
-                // Fetch all listings from the collection and sort by newest first
                 const careers = await careersCollection
                     .find({})
                     .sort({ createdAt: -1 })
@@ -59,9 +106,14 @@ async function run() {
         // GET: Fetch only the careers created by the currently logged-in user
         app.get('/api/my-careers', async (req, res) => {
             try {
+                const { userId } = req.query;
+
+                if (!userId) {
+                    return res.status(400).json({ success: false, error: 'User ID is required' });
+                }
 
                 const userCareers = await careersCollection
-                    .find({ userId: req.userId })
+                    .find({ userId: userId })
                     .sort({ createdAt: -1 })
                     .toArray();
 
@@ -71,13 +123,10 @@ async function run() {
                     data: userCareers
                 });
             } catch (error) {
-                console.error("Error fetching user's specific career listings:", error);
-                res.status(500).json({
-                    error: 'Failed to retrieve your career listings.'
-                });
+                console.error("Database error:", error);
+                res.status(500).json({ success: false, error: 'Failed to retrieve listings.' });
             }
         });
-
 
         // POST: Add a new career listing
         app.post('/api/careers', async (req, res) => {
@@ -96,7 +145,6 @@ async function run() {
                     userId,
                     creatorEmail
                 } = req.body;
-
 
                 if (!title || !category || !shortDescription || !fullDescription || !userId) {
                     return res.status(400).json({ error: "Missing required fields, including User Authentication." });
@@ -131,6 +179,7 @@ async function run() {
                 return res.status(500).json({ error: "Internal server error." });
             }
         });
+
         // GET: Fetch single career by ID
         app.get('/api/careers/:id', async (req, res) => {
             try {
@@ -156,15 +205,15 @@ async function run() {
             }
         });
 
+        // POST: Save a career
         app.post('/api/saved-careers', async (req, res) => {
             try {
-                const { careerId, userId } = req.body; // 👈 ফ্রন্টএন্ড থেকে userId পাঠানো যেতে পারে অথবা ডামি আইডি
+                const { careerId, userId } = req.body;
 
                 if (!careerId || !ObjectId.isValid(careerId)) {
                     return res.status(400).json({ error: 'A valid career ID is required.' });
                 }
 
-                // অথেনটিকেশন না থাকলে ডামি আইডি বা ফ্রন্টএন্ডের আইডি ব্যবহার
                 const finalUserId = userId && ObjectId.isValid(userId) ? new ObjectId(userId) : new ObjectId("60c72b2f9b1d8b2bad888888");
 
                 const existingSave = await savedCareersCollection.findOne({
@@ -195,6 +244,7 @@ async function run() {
             }
         });
 
+        // POST: Submit an application
         app.post('/api/applications', async (req, res) => {
             try {
                 const { careerId, fullName, email, resumeUrl, coverLetter, userId } = req.body;
@@ -232,10 +282,10 @@ async function run() {
             }
         });
 
+        // DELETE: Remove a career listing
         app.delete('/api/careers/:id', async (req, res) => {
             try {
                 const careerId = req.params.id;
-
 
                 if (!ObjectId.isValid(careerId)) {
                     return res.status(400).json({
@@ -244,9 +294,7 @@ async function run() {
                     });
                 }
 
-
                 const result = await careersCollection.deleteOne({ _id: new ObjectId(careerId) });
-
 
                 if (result.deletedCount === 1) {
                     return res.status(200).json({
@@ -259,7 +307,6 @@ async function run() {
                         error: 'Career listing not found.'
                     });
                 }
-
             } catch (error) {
                 console.error("Error deleting career listing:", error);
                 return res.status(500).json({
@@ -269,19 +316,18 @@ async function run() {
             }
         });
 
-        // await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
-    } finally {
-        // await client.close();
+    } catch (e) {
+        console.error("MongoDB connection failed:", e);
     }
 }
+
 run().catch(console.dir);
 
-
 app.get('/', (req, res) => {
-    res.send('Server is Serving')
-})
+    res.send('Server is Serving');
+});
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`)
-})
+    console.log(`Server running on port ${PORT}`);
+});
