@@ -25,6 +25,7 @@ const client = new MongoClient(uri, {
     }
 });
 
+
 app.post('/api/chat', async (req, res) => {
     const { sessionId, messages } = req.body;
 
@@ -39,7 +40,8 @@ app.post('/api/chat', async (req, res) => {
     res.setHeader('Transfer-Encoding', 'chunked');
 
     try {
-
+        // Gemini uses 'model' instead of 'assistant', and expects contents as
+        // { role, parts: [{ text }] } rather than { role, content }.
         const contents = messages.map((m) => ({
             role: m.role === 'assistant' ? 'model' : 'user',
             parts: [{ text: m.content }],
@@ -76,11 +78,12 @@ async function run() {
         const dbName = process.env.AUTH_DB_NAME;
         const db = client.db(dbName);
 
-        const usersCollection = db.collection("user");
         const careersCollection = db.collection("careers");
         const savedCareersCollection = db.collection("saved-careers");
         const applicationsCollection = db.collection("applications");
+        const usersCollection = db.collection("user");
 
+        // GET: Fetch a single user's profile
         app.get('/api/profile/:userId', async (req, res) => {
             try {
                 const { userId } = req.params;
@@ -271,7 +274,10 @@ async function run() {
                     return res.status(400).json({ error: 'A valid career ID is required.' });
                 }
 
-                const finalUserId = userId && ObjectId.isValid(userId) ? new ObjectId(userId) : new ObjectId("60c72b2f9b1d8b2bad888888");
+                if (!userId || !ObjectId.isValid(userId)) {
+                    return res.status(400).json({ error: 'You must be signed in to save a career.' });
+                }
+                const finalUserId = new ObjectId(userId);
 
                 const existingSave = await savedCareersCollection.findOne({
                     userId: finalUserId,
@@ -301,41 +307,144 @@ async function run() {
             }
         });
 
-        // POST: Submit an application
-        app.post('/api/applications', async (req, res) => {
+        // GET: Fetch the current user's own submitted applications
+        app.get("/api/applications", async (req, res) => {
             try {
-                const { careerId, fullName, email, resumeUrl, coverLetter, userId } = req.body;
+                const { userId } = req.query;
 
-                if (!careerId || !ObjectId.isValid(careerId)) {
-                    return res.status(400).json({ error: 'A valid career ID is required.' });
+                if (!userId) {
+                    return res.status(400).json({
+                        success: false,
+                        error: "User ID is required.",
+                    });
                 }
 
-                if (!fullName?.trim() || !email?.trim() || !resumeUrl?.trim()) {
-                    return res.status(400).json({ error: 'Full name, email, and resume link are mandatory.' });
+                const applications = await applicationsCollection
+                    .find({ userId })
+                    .sort({ appliedAt: -1 })
+                    .toArray();
+
+                const result = await Promise.all(
+                    applications.map(async (application) => {
+
+                        let career = null;
+
+                        if (application.careerId) {
+
+                            if (ObjectId.isValid(application.careerId)) {
+
+                                career = await careersCollection.findOne({
+                                    _id: new ObjectId(application.careerId),
+                                });
+
+                            } else {
+
+                                career = await careersCollection.findOne({
+                                    _id: application.careerId,
+                                });
+
+                            }
+                        }
+
+                        return {
+                            _id: application._id,
+                            appliedAt: application.appliedAt,
+                            resumeUrl: application.resumeUrl,
+                            coverLetter: application.coverLetter,
+                            status: application.status,
+
+                            career: career
+                                ? {
+                                    _id: career._id,
+                                    title: career.title,
+                                    location: career.location,
+                                    imageUrl: career.imageUrl,
+                                }
+                                : null,
+                        };
+                    })
+                );
+
+                res.status(200).json({
+                    success: true,
+                    data: result,
+                });
+
+            } catch (err) {
+
+                console.error(err);
+
+                res.status(500).json({
+                    success: false,
+                    error: err.message,
+                });
+            }
+        });
+
+        // POST: Submit an application
+        app.post("/api/applications", async (req, res) => {
+            try {
+                const {
+                    careerId,
+                    userId,
+                    fullName,
+                    email,
+                    resumeUrl,
+                    coverLetter,
+                } = req.body;
+
+                if (
+                    !careerId ||
+                    !userId ||
+                    !fullName ||
+                    !email ||
+                    !resumeUrl
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        error: "All required fields are required.",
+                    });
                 }
 
-                const finalUserId = userId && ObjectId.isValid(userId) ? new ObjectId(userId) : new ObjectId("60c72b2f9b1d8b2bad888888");
+                // একই চাকরিতে আবার apply করা আটকাবে
+                const alreadyApplied = await applicationsCollection.findOne({
+                    careerId,
+                    userId,
+                });
 
-                const newApplication = {
-                    userId: finalUserId,
-                    careerId: new ObjectId(careerId),
-                    fullName: fullName.trim(),
-                    email: email.trim(),
-                    resumeUrl: resumeUrl.trim(),
-                    coverLetter: coverLetter ? coverLetter.trim() : null,
-                    appliedAt: new Date()
+                if (alreadyApplied) {
+                    return res.status(400).json({
+                        success: false,
+                        error: "You have already applied for this job.",
+                    });
+                }
+
+                const application = {
+                    careerId,
+                    userId,
+                    fullName,
+                    email,
+                    resumeUrl,
+                    coverLetter: coverLetter || "",
+                    status: "submitted",
+                    appliedAt: new Date(),
                 };
 
-                const result = await applicationsCollection.insertOne(newApplication);
+                const result = await applicationsCollection.insertOne(application);
 
-                return res.status(201).json({
+                res.status(201).json({
                     success: true,
-                    message: 'Application successfully processed.',
-                    insertedId: result.insertedId
+                    insertedId: result.insertedId,
+                    message: "Application submitted successfully.",
                 });
-            } catch (error) {
-                console.error(error);
-                return res.status(500).json({ error: 'Internal server error while processing application.' });
+
+            } catch (err) {
+                console.error(err);
+
+                res.status(500).json({
+                    success: false,
+                    error: err.message,
+                });
             }
         });
 
