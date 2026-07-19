@@ -265,6 +265,52 @@ async function run() {
             }
         });
 
+        app.get("/api/saved-careers", async (req, res) => {
+            try {
+                const { userId } = req.query;
+
+                if (!userId || !ObjectId.isValid(userId)) {
+                    return res.status(400).json({
+                        success: false,
+                        error: "Valid userId is required.",
+                    });
+                }
+
+                const saved = await savedCareersCollection
+                    .find({
+                        userId: new ObjectId(userId),
+                    })
+                    .sort({ savedAt: -1 })
+                    .toArray();
+
+                const careers = await Promise.all(
+                    saved.map(async (item) => {
+                        const career = await careersCollection.findOne({
+                            _id: item.careerId,
+                        });
+
+                        return {
+                            _id: item._id,
+                            savedAt: item.savedAt,
+                            career,
+                        };
+                    })
+                );
+
+                res.send({
+                    success: true,
+                    data: careers,
+                });
+            } catch (err) {
+                console.log(err);
+
+                res.status(500).send({
+                    success: false,
+                    error: err.message,
+                });
+            }
+        });
+
         // POST: Save a career
         app.post('/api/saved-careers', async (req, res) => {
             try {
