@@ -103,7 +103,7 @@ export async function verifyAuth(req, res, next) {
 
 async function run() {
     try {
-        // await client.connect();
+        await client.connect();
         const dbName = process.env.AUTH_DB_NAME;
         const db = client.db(dbName);
 
