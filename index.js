@@ -18,7 +18,6 @@ const sessionStore = new Map();
 const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || 'http://localhost:3000';
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_SERVER_URL}/api/auth/jwks`));
 
-
 const uri = process.env.MONGODB_URI;
 
 const client = new MongoClient(uri, {
@@ -28,7 +27,6 @@ const client = new MongoClient(uri, {
         deprecationErrors: true,
     }
 });
-
 
 app.post('/api/chat', async (req, res) => {
     const { sessionId, messages } = req.body;
@@ -76,7 +74,12 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-
+// ---------------------------------------------------------------------------
+// Auth middleware — verifies the BetterAuth-issued JWT via JWKS and attaches
+// the authenticated user's id to req.userId. Every route below that touches
+// user-specific data uses req.userId as the source of truth, never a
+// client-supplied userId, to prevent impersonation / IDOR.
+// ---------------------------------------------------------------------------
 export async function verifyAuth(req, res, next) {
     try {
         const authHeader = req.headers.authorization;
@@ -113,7 +116,6 @@ async function run() {
         const usersCollection = db.collection("user");
 
         // GET: Fetch a single user's profile
-
         app.get('/api/profile/:userId', verifyAuth, async (req, res) => {
             try {
                 const { userId } = req.params;
@@ -145,11 +147,8 @@ async function run() {
         // PATCH: Update name and/or avatar image
         app.patch('/api/profile', verifyAuth, async (req, res) => {
             try {
-                const { userId, name, image } = req.body;
-
-                if (!userId || !ObjectId.isValid(userId)) {
-                    return res.status(400).json({ success: false, error: 'A valid user ID is required.' });
-                }
+                const { name, image } = req.body;
+                const userId = req.userId; // never trust body.userId for the target — always the token's own id
 
                 const update = { updatedAt: new Date() };
                 if (typeof name === 'string' && name.trim()) update.name = name.trim();
@@ -176,7 +175,7 @@ async function run() {
             }
         });
 
-        // GET: Fetch all career listings
+        // GET: Fetch all career listings (public — browse before signup)
         app.get('/api/careers', async (req, res) => {
             try {
                 const careers = await careersCollection
@@ -200,14 +199,10 @@ async function run() {
         // GET: Fetch only the careers created by the currently logged-in user
         app.get('/api/my-careers', verifyAuth, async (req, res) => {
             try {
-                const { userId } = req.query;
-
-                if (!userId) {
-                    return res.status(400).json({ success: false, error: 'User ID is required' });
-                }
+                const userId = req.userId; // scoped to the authenticated user, not a query param
 
                 const userCareers = await careersCollection
-                    .find({ userId: userId })
+                    .find({ userId })
                     .sort({ createdAt: -1 })
                     .toArray();
 
@@ -236,12 +231,11 @@ async function run() {
                     coverImage,
                     responsibilities,
                     skills,
-                    userId,
                     creatorEmail
                 } = req.body;
 
-                if (!title || !category || !shortDescription || !fullDescription || !userId) {
-                    return res.status(400).json({ error: "Missing required fields, including User Authentication." });
+                if (!title || !category || !shortDescription || !fullDescription) {
+                    return res.status(400).json({ error: "Missing required fields." });
                 }
 
                 const newCareerListing = {
@@ -255,7 +249,7 @@ async function run() {
                     imageUrl: coverImage || "https://images.unsplash.com/photo-1586717791821-3f44a563fa4c?q=80&w=80",
                     responsibilities: Array.isArray(responsibilities) ? responsibilities : [],
                     skills: Array.isArray(skills) ? skills : [],
-                    userId: userId,
+                    userId: req.userId, // taken from the verified token, not the request body
                     creatorEmail,
                     createdAt: new Date()
                 };
@@ -274,8 +268,8 @@ async function run() {
             }
         });
 
-        // GET: Fetch single career by ID
-        app.get('/api/careers/:id', verifyAuth, async (req, res) => {
+        // GET: Fetch single career by ID (public — browse before signup)
+        app.get('/api/careers/:id', async (req, res) => {
             try {
                 const { id } = req.params;
 
@@ -299,21 +293,13 @@ async function run() {
             }
         });
 
+        // GET: Fetch the current user's saved careers
         app.get("/api/saved-careers", verifyAuth, async (req, res) => {
             try {
-                const { userId } = req.query;
-
-                if (!userId || !ObjectId.isValid(userId)) {
-                    return res.status(400).json({
-                        success: false,
-                        error: "Valid userId is required.",
-                    });
-                }
+                const userId = req.userId;
 
                 const saved = await savedCareersCollection
-                    .find({
-                        userId: new ObjectId(userId),
-                    })
+                    .find({ userId: new ObjectId(userId) })
                     .sort({ savedAt: -1 })
                     .toArray();
 
@@ -348,15 +334,13 @@ async function run() {
         // POST: Save a career
         app.post('/api/saved-careers', verifyAuth, async (req, res) => {
             try {
-                const { careerId, userId } = req.body;
+                const { careerId } = req.body;
+                const userId = req.userId;
 
                 if (!careerId || !ObjectId.isValid(careerId)) {
                     return res.status(400).json({ error: 'A valid career ID is required.' });
                 }
 
-                if (!userId || !ObjectId.isValid(userId)) {
-                    return res.status(400).json({ error: 'You must be signed in to save a career.' });
-                }
                 const finalUserId = new ObjectId(userId);
 
                 const existingSave = await savedCareersCollection.findOne({
@@ -390,14 +374,7 @@ async function run() {
         // GET: Fetch the current user's own submitted applications
         app.get("/api/applications", verifyAuth, async (req, res) => {
             try {
-                const { userId } = req.query;
-
-                if (!userId) {
-                    return res.status(400).json({
-                        success: false,
-                        error: "User ID is required.",
-                    });
-                }
+                const userId = req.userId;
 
                 const applications = await applicationsCollection
                     .find({ userId })
@@ -406,23 +383,17 @@ async function run() {
 
                 const result = await Promise.all(
                     applications.map(async (application) => {
-
                         let career = null;
 
                         if (application.careerId) {
-
                             if (ObjectId.isValid(application.careerId)) {
-
                                 career = await careersCollection.findOne({
                                     _id: new ObjectId(application.careerId),
                                 });
-
                             } else {
-
                                 career = await careersCollection.findOne({
                                     _id: application.careerId,
                                 });
-
                             }
                         }
 
@@ -451,7 +422,6 @@ async function run() {
                 });
 
             } catch (err) {
-
                 console.error(err);
 
                 res.status(500).json({
@@ -466,27 +436,21 @@ async function run() {
             try {
                 const {
                     careerId,
-                    userId,
                     fullName,
                     email,
                     resumeUrl,
                     coverLetter,
                 } = req.body;
+                const userId = req.userId;
 
-                if (
-                    !careerId ||
-                    !userId ||
-                    !fullName ||
-                    !email ||
-                    !resumeUrl
-                ) {
+                if (!careerId || !fullName || !email || !resumeUrl) {
                     return res.status(400).json({
                         success: false,
                         error: "All required fields are required.",
                     });
                 }
 
-                // একই চাকরিতে আবার apply করা আটকাবে
+
                 const alreadyApplied = await applicationsCollection.findOne({
                     careerId,
                     userId,
@@ -528,7 +492,7 @@ async function run() {
             }
         });
 
-        // DELETE: Remove a career listing
+        // DELETE: Remove a career listing (only its owner can delete it)
         app.delete('/api/careers/:id', verifyAuth, async (req, res) => {
             try {
                 const careerId = req.params.id;
@@ -538,6 +502,19 @@ async function run() {
                         success: false,
                         error: 'Invalid career listing ID format.'
                     });
+                }
+
+                const existing = await careersCollection.findOne({ _id: new ObjectId(careerId) });
+
+                if (!existing) {
+                    return res.status(404).json({
+                        success: false,
+                        error: 'Career listing not found.'
+                    });
+                }
+
+                if (existing.userId !== req.userId) {
+                    return res.status(403).json({ success: false, error: 'Forbidden.' });
                 }
 
                 const result = await careersCollection.deleteOne({ _id: new ObjectId(careerId) });
@@ -561,8 +538,6 @@ async function run() {
                 });
             }
         });
-
-
 
         // POST: AI Image Understanding
         app.post('/api/image-understanding', verifyAuth, async (req, res) => {
@@ -608,8 +583,7 @@ async function run() {
             }
         });
 
-
-        // console.log("Pinged your deployment. You successfully connected to MongoDB!");
+        console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } catch (e) {
         console.error("MongoDB connection failed:", e);
     }
@@ -621,6 +595,11 @@ app.get('/', (req, res) => {
     res.send('Server is Serving');
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+export default app;
