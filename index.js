@@ -1,6 +1,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { MongoClient, ServerApiVersion, ObjectId } from 'mongodb';
 import { GoogleGenAI } from '@google/genai';
 
@@ -10,10 +11,13 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const sessionStore = new Map();
+const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || 'http://localhost:3000';
+const JWKS = createRemoteJWKSet(new URL(`${AUTH_SERVER_URL}/api/auth/jwks`));
+
 
 const uri = process.env.MONGODB_URI;
 
@@ -72,6 +76,31 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
+
+export async function verifyAuth(req, res, next) {
+    try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ success: false, error: 'Missing or invalid Authorization header.' });
+        }
+
+        const token = authHeader.split(' ')[1];
+
+        const { payload } = await jwtVerify(token, JWKS, {
+            issuer: AUTH_SERVER_URL,
+        });
+
+        req.userId = payload.sub;
+        req.user = payload;
+
+        next();
+    } catch (err) {
+        console.error('Token verification failed:', err.message);
+        return res.status(401).json({ success: false, error: 'Invalid or expired token.' });
+    }
+}
+
 async function run() {
     try {
         await client.connect();
@@ -84,9 +113,14 @@ async function run() {
         const usersCollection = db.collection("user");
 
         // GET: Fetch a single user's profile
-        app.get('/api/profile/:userId', async (req, res) => {
+
+        app.get('/api/profile/:userId', verifyAuth, async (req, res) => {
             try {
                 const { userId } = req.params;
+
+                if (userId !== req.userId) {
+                    return res.status(403).json({ success: false, error: 'Forbidden.' });
+                }
 
                 if (!ObjectId.isValid(userId)) {
                     return res.status(400).json({ success: false, error: 'Invalid user ID format.' });
@@ -109,7 +143,7 @@ async function run() {
         });
 
         // PATCH: Update name and/or avatar image
-        app.patch('/api/profile', async (req, res) => {
+        app.patch('/api/profile', verifyAuth, async (req, res) => {
             try {
                 const { userId, name, image } = req.body;
 
@@ -164,7 +198,7 @@ async function run() {
         });
 
         // GET: Fetch only the careers created by the currently logged-in user
-        app.get('/api/my-careers', async (req, res) => {
+        app.get('/api/my-careers', verifyAuth, async (req, res) => {
             try {
                 const { userId } = req.query;
 
@@ -189,7 +223,7 @@ async function run() {
         });
 
         // POST: Add a new career listing
-        app.post('/api/careers', async (req, res) => {
+        app.post('/api/careers', verifyAuth, async (req, res) => {
             try {
                 const {
                     title,
@@ -241,7 +275,7 @@ async function run() {
         });
 
         // GET: Fetch single career by ID
-        app.get('/api/careers/:id', async (req, res) => {
+        app.get('/api/careers/:id', verifyAuth, async (req, res) => {
             try {
                 const { id } = req.params;
 
@@ -265,7 +299,7 @@ async function run() {
             }
         });
 
-        app.get("/api/saved-careers", async (req, res) => {
+        app.get("/api/saved-careers", verifyAuth, async (req, res) => {
             try {
                 const { userId } = req.query;
 
@@ -312,7 +346,7 @@ async function run() {
         });
 
         // POST: Save a career
-        app.post('/api/saved-careers', async (req, res) => {
+        app.post('/api/saved-careers', verifyAuth, async (req, res) => {
             try {
                 const { careerId, userId } = req.body;
 
@@ -354,7 +388,7 @@ async function run() {
         });
 
         // GET: Fetch the current user's own submitted applications
-        app.get("/api/applications", async (req, res) => {
+        app.get("/api/applications", verifyAuth, async (req, res) => {
             try {
                 const { userId } = req.query;
 
@@ -428,7 +462,7 @@ async function run() {
         });
 
         // POST: Submit an application
-        app.post("/api/applications", async (req, res) => {
+        app.post("/api/applications", verifyAuth, async (req, res) => {
             try {
                 const {
                     careerId,
@@ -495,7 +529,7 @@ async function run() {
         });
 
         // DELETE: Remove a career listing
-        app.delete('/api/careers/:id', async (req, res) => {
+        app.delete('/api/careers/:id', verifyAuth, async (req, res) => {
             try {
                 const careerId = req.params.id;
 
@@ -527,6 +561,53 @@ async function run() {
                 });
             }
         });
+
+
+
+        // POST: AI Image Understanding
+        app.post('/api/image-understanding', verifyAuth, async (req, res) => {
+            try {
+                const { imageBase64, mimeType } = req.body;
+
+                if (!imageBase64 || !mimeType) {
+                    return res.status(400).json({ success: false, error: 'imageBase64 and mimeType are required.' });
+                }
+
+                const prompt = `Analyze this image and respond with ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
+                {
+                "caption": "one short punchy caption, max 12 words",
+                "description": "2-4 sentence plain-language explanation of what's happening in the image",
+                "objects": ["object1", "object2", ...]
+                }
+                List every distinct object/entity you can confidently identify in "objects" (max 15).`;
+
+                const result = await ai.models.generateContent({
+                    model: 'gemini-flash-latest',
+                    contents: [{
+                        role: 'user',
+                        parts: [
+                            { inlineData: { mimeType, data: imageBase64 } },
+                            { text: prompt },
+                        ],
+                    }],
+                });
+
+                const cleaned = result.text.trim().replace(/^```json\s*|```$/g, '').trim();
+
+                let parsed;
+                try {
+                    parsed = JSON.parse(cleaned);
+                } catch (e) {
+                    return res.status(502).json({ success: false, error: 'Model returned unparseable output.' });
+                }
+
+                res.status(200).json({ success: true, data: parsed });
+            } catch (error) {
+                console.error('Image understanding error:', error);
+                res.status(500).json({ success: false, error: 'Failed to analyze image.' });
+            }
+        });
+
 
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } catch (e) {
